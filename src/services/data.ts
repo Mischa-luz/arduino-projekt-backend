@@ -102,8 +102,7 @@ export const service: Service = {
 			}
 
 			case "POST /": {
-				let data: {
-					timestamp?: number;
+				let payload: {
 					temperature?: number;
 					humidity?: number;
 					deviceId?: string;
@@ -112,11 +111,10 @@ export const service: Service = {
 				const contentType = request.headers.get("Content-Type");
 				switch (contentType) {
 					case "application/json": {
-						const { timestamp, humidity, temperature, deviceId } = await request.json<DataKV>();
-						data = {
-							timestamp: z.number().safeParse(timestamp).data ?? Date.now(),
-							humidity: z.number().safeParse(humidity).data,
-							temperature: z.number().safeParse(temperature).data,
+						const { humidity, temperature, deviceId } = await request.json<DataKV>();
+						payload = {
+							humidity: z.coerce.number().safeParse(humidity).data,
+							temperature: z.coerce.number().safeParse(temperature).data,
 							deviceId: z.string().safeParse(deviceId).data,
 						};
 						break;
@@ -124,28 +122,43 @@ export const service: Service = {
 					case "application/x-www-form-urlencoded": {
 						const form = await request.formData();
 
-						data = {
-							timestamp: z.number().safeParse(form.get("timestamp")).data ?? Date.now(),
-							humidity: z.number().safeParse(form.get("humidity")).data,
-							temperature: z.number().safeParse(form.get("temperature")).data,
+						payload = {
+							humidity: z.coerce.number().safeParse(form.get("humidity")).data,
+							temperature: z.coerce.number().safeParse(form.get("temperature")).data,
 							deviceId: z.string().safeParse(form.get("deviceId")).data,
 						};
 						break;
 					}
 					default: {
-						return new Response(`Unsupported Content-Type: ${contentType}`, {
-							status: 415,
-						});
+						const text = await request.text();
+						//parse temperature=value&humidity=value
+						const params = new URLSearchParams(text);
+						console.log("test: ", text);
+						console.log("params: ", params);
+						payload = {
+							humidity: z.coerce.number().safeParse(params.get("humidity")).data,
+							temperature: z.coerce.number().safeParse(params.get("temperature")).data,
+							deviceId: z.string().safeParse(params.get("deviceId")).data,
+						};
+						break;
 					}
 				}
 
-				if (typeof data.temperature !== "number" || typeof data.humidity !== "number") {
+				console.log("Received data:", payload);
+
+				if (typeof payload.temperature !== "number" || typeof payload.humidity !== "number") {
 					return new Response("Missing or invalid temperature or humidity value", {
 						status: 400,
 					});
 				}
 
-				const key = `data_${data.timestamp}_${data.deviceId || "default"}`;
+				const key = `data_${Date.now()}_${payload.deviceId || "default"}`;
+				const data: DataKV = {
+					timestamp: Date.now(),
+					temperature: payload.temperature,
+					humidity: payload.humidity,
+					deviceId: payload.deviceId,
+				};
 
 				await env.ARDUINO_DATA_KV.put(key, JSON.stringify(data), { expirationTtl: 86400 });
 
