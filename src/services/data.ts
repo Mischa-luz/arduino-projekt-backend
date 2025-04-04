@@ -10,8 +10,22 @@ type DataKV = {
 
 type GetDataResponse = DataKV[];
 
-// Define supported time scales for data aggregation
-export type TimeScale = "raw" | "30s" | "1m" | "5m" | "1h" | "6h" | "24h" | "7d" | "30d";
+// biome-ignore lint/suspicious/noExplicitAny: <explanation>
+export function enumToZod(myEnum: any): [string, ...string[]] {
+	// biome-ignore lint/suspicious/noExplicitAny: <explanation>
+	return Object.values(myEnum).map((value: any) => `${value}`) as [string, ...string[]];
+}
+
+export const TimeScale = {
+	"30m": "30m",
+	"1h": "1h",
+	"6h": "6h",
+	"24h": "24h",
+	"7d": "7d",
+	"30d": "30d",
+	all: "all",
+};
+export type TimeScale = (typeof TimeScale)[keyof typeof TimeScale];
 
 export const service: Service = {
 	path: "/v1/data/",
@@ -25,13 +39,45 @@ export const service: Service = {
 		switch (`${request.method} /${subPath.split("/")[0]}`) {
 			case "GET /": {
 				const url = new URL(request.url);
-				const scale = (url.searchParams.get("timeScale") as TimeScale) || "raw";
-				const limit = Number.parseInt(url.searchParams.get("limit") || "1000");
+				const timeScale =
+					z.enum(enumToZod(TimeScale)).safeParse(url.searchParams.get("timeScale")).data ?? "24h";
+				const limit = z.number().safeParse(url.searchParams.get("limit")).data ?? 1000;
 
-				const kvData = await env.ARDUINO_DATA_KV.list();
+				// Calculate cutoff time for the requested time window
+				const now = Date.now();
+				const timeWindowMs = getTimeWindowMs(timeScale);
+				let cutoffTime = 0; // Default to earliest time (all data)
+
+				// Set cutoff time for everything except "all"
+				if (timeScale !== "all") {
+					cutoffTime = now - timeWindowMs;
+				}
+
+				const collectedKeys: KVNamespaceListKey<unknown>[] = [];
+				let cursor = undefined;
+				while (collectedKeys.length < limit) {
+					const listResult: KVNamespaceListResult<unknown> = await env.ARDUINO_DATA_KV.list({
+						cursor,
+					});
+					const keys = listResult.keys;
+
+					const filteredKeys = keys.filter((key) => {
+						const timeStampString = key.name.split("_")[1];
+						const timeStamp = z.coerce.number().safeParse(timeStampString).data;
+
+						return timeStamp && timeStamp >= cutoffTime;
+					});
+
+					collectedKeys.push(...filteredKeys);
+
+					if (listResult.list_complete) {
+						break;
+					}
+					cursor = listResult.cursor;
+				}
 
 				const readings: DataKV[] = [];
-				for (const key of kvData.keys) {
+				for (const key of collectedKeys) {
 					const value: DataKV | null = await env.ARDUINO_DATA_KV.get(key.name, "json");
 					if (value) {
 						readings.push(value);
@@ -40,9 +86,16 @@ export const service: Service = {
 
 				readings.sort((a, b) => b.timestamp - a.timestamp);
 
-				const scaledData: GetDataResponse = aggregateReadings(readings, scale, limit);
+				// Now that we have already filtered data by timestamp at the KV level,
+				// we just need to handle aggregation
+				const aggregationLevel = determineAggregationLevel(readings.length, timeWindowMs, limit);
+				const filteredAndAggregatedData: GetDataResponse = aggregateReadings(
+					readings,
+					aggregationLevel,
+					limit,
+				);
 
-				return new Response(JSON.stringify(scaledData), {
+				return new Response(JSON.stringify(filteredAndAggregatedData), {
 					headers: { "Content-Type": "application/json" },
 					status: 200,
 				});
@@ -105,47 +158,74 @@ export const service: Service = {
 };
 
 /**
- * Aggregates temperature readings based on the specified time scale
+ * Converts a TimeScale to milliseconds
  */
-function aggregateReadings(readings: DataKV[], scale: TimeScale, limit: number): DataKV[] {
+function getTimeWindowMs(timeScale: TimeScale): number {
+	switch (timeScale) {
+		case "30m":
+			return 30 * 60 * 1000;
+		case "1h":
+			return 60 * 60 * 1000;
+		case "6h":
+			return 6 * 60 * 60 * 1000;
+		case "24h":
+			return 24 * 60 * 60 * 1000;
+		case "7d":
+			return 7 * 24 * 60 * 60 * 1000;
+		case "30d":
+			return 30 * 24 * 60 * 60 * 1000;
+		case "all":
+			return Number.POSITIVE_INFINITY;
+		default:
+			return 24 * 60 * 60 * 1000; // Default to 24h
+	}
+}
+
+/**
+ * Determines appropriate bucket size for aggregation based on data density
+ */
+function determineAggregationLevel(dataCount: number, timeWindowMs: number, limit: number): number {
+	if (dataCount <= limit) {
+		return 1;
+	}
+
+	const reductionFactor = Math.ceil(dataCount / limit);
+
+	const minBucketSize = 15 * 1000; // 15 seconds
+	const estimatedBucketSize = Math.ceil((timeWindowMs / limit) * reductionFactor);
+
+	return Math.max(minBucketSize, estimatedBucketSize);
+}
+
+/**
+ * Aggregates temperature readings based on the specified bucket size in milliseconds
+ */
+function aggregateReadings(readings: DataKV[], bucketSizeMs: number, limit: number): DataKV[] {
 	// If no readings or invalid scale, return empty array
+	if (!readings.length || bucketSizeMs <= 0) return [];
 
 	const aggregated: DataKV[] = [];
-	const buckets = new Map<number, { temperature: number[]; humidity: number[] }>();
-
-	// Define time bucket size in milliseconds
-	const bucketSize =
-		scale === "raw"
-			? 1
-			: scale === "30s"
-				? 30000
-				: scale === "1m"
-					? 60000
-					: scale === "5m"
-						? 300000
-						: scale === "1h"
-							? 3600000
-							: scale === "6h"
-								? 21600000
-								: scale === "24h"
-									? 86400000
-									: scale === "7d"
-										? 604800000
-										: scale === "30d"
-											? 2592000000
-											: 3600000; // default to 1 hour
+	const buckets = new Map<
+		number,
+		{ temperature: number[]; humidity: number[]; deviceIds: Set<string> }
+	>();
 
 	// Group readings into time buckets
 	for (const reading of readings) {
 		// Calculate bucket key (timestamp rounded to bucket size)
-		const bucketKey = Math.floor(reading.timestamp / bucketSize) * bucketSize;
+		const bucketKey = Math.floor(reading.timestamp / bucketSizeMs) * bucketSizeMs;
 
 		if (!buckets.has(bucketKey)) {
-			buckets.set(bucketKey, { temperature: [], humidity: [] });
+			buckets.set(bucketKey, { temperature: [], humidity: [], deviceIds: new Set() });
 		}
 
-		buckets.get(bucketKey)?.temperature.push(reading.temperature);
-		buckets.get(bucketKey)?.humidity.push(reading.humidity);
+		// biome-ignore lint/style/noNonNullAssertion: <explanation>
+		const bucket = buckets.get(bucketKey)!;
+		bucket.temperature.push(reading.temperature);
+		bucket.humidity.push(reading.humidity);
+		if (reading.deviceId) {
+			bucket.deviceIds.add(reading.deviceId);
+		}
 	}
 
 	// Calculate averages for each bucket
@@ -154,10 +234,19 @@ function aggregateReadings(readings: DataKV[], scale: TimeScale, limit: number):
 			values.temperature.reduce((sum, val) => sum + val, 0) / values.temperature.length;
 		const humidityAvg = values.humidity.reduce((sum, val) => sum + val, 0) / values.humidity.length;
 
+		// Combine deviceIds if there are multiple in this bucket
+		let deviceId: string | undefined = undefined;
+		if (values.deviceIds.size === 1) {
+			deviceId = Array.from(values.deviceIds)[0];
+		} else if (values.deviceIds.size > 1) {
+			deviceId = Array.from(values.deviceIds).join(",");
+		}
+
 		aggregated.push({
 			timestamp,
 			temperature: Number(temperatureAvg.toFixed(2)),
 			humidity: Number(humidityAvg.toFixed(2)),
+			deviceId,
 		});
 	}
 
