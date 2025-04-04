@@ -109,7 +109,8 @@ export const service: Service = {
 					deviceId?: string;
 				} = {};
 
-				switch (request.headers.get("Content-Type")) {
+				const contentType = request.headers.get("Content-Type");
+				switch (contentType) {
 					case "application/json": {
 						const { timestamp, humidity, temperature, deviceId } = await request.json<DataKV>();
 						data = {
@@ -132,7 +133,7 @@ export const service: Service = {
 						break;
 					}
 					default: {
-						return new Response("Unsupported Content-Type", {
+						return new Response(`Unsupported Content-Type: ${contentType}`, {
 							status: 415,
 						});
 					}
