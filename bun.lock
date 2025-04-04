@@ -3,6 +3,9 @@
   "workspaces": {
     "": {
       "name": "tiny-brook-e156",
+      "dependencies": {
+        "zod": "^3.24.2",
+      },
       "devDependencies": {
         "@biomejs/biome": "1.9.4",
         "@cloudflare/vitest-pool-workers": "^0.7.5",

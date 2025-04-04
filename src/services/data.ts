@@ -1,4 +1,5 @@
 import type { Service } from ".";
+import { z } from "zod";
 
 type DataKV = {
 	timestamp: number;
@@ -7,11 +8,10 @@ type DataKV = {
 	deviceId?: string;
 };
 
-type PostDataPayload = DataKV;
 type GetDataResponse = DataKV[];
 
 // Define supported time scales for data aggregation
-type TimeScale = "raw" | "minute" | "hour" | "day" | "week" | "month";
+export type TimeScale = "raw" | "30s" | "1m" | "5m" | "1h" | "6h" | "24h" | "7d" | "30d";
 
 export const service: Service = {
 	path: "/v1/data/",
@@ -25,7 +25,7 @@ export const service: Service = {
 		switch (`${request.method} /${subPath.split("/")[0]}`) {
 			case "GET /": {
 				const url = new URL(request.url);
-				const scale = (url.searchParams.get("scale") as TimeScale) || "raw";
+				const scale = (url.searchParams.get("timeScale") as TimeScale) || "raw";
 				const limit = Number.parseInt(url.searchParams.get("limit") || "1000");
 
 				const kvData = await env.ARDUINO_DATA_KV.list();
@@ -40,8 +40,7 @@ export const service: Service = {
 
 				readings.sort((a, b) => b.timestamp - a.timestamp);
 
-				const scaledData: GetDataResponse =
-					scale === "raw" ? readings.slice(0, limit) : aggregateReadings(readings, scale, limit);
+				const scaledData: GetDataResponse = aggregateReadings(readings, scale, limit);
 
 				return new Response(JSON.stringify(scaledData), {
 					headers: { "Content-Type": "application/json" },
@@ -50,32 +49,50 @@ export const service: Service = {
 			}
 
 			case "POST /": {
-				try {
-					const data: PostDataPayload = await request.json();
+				let data: {
+					timestamp?: number;
+					temperature?: number;
+					humidity?: number;
+					deviceId?: string;
+				} = {};
 
-					if (typeof data.temperature !== "number" || typeof data.humidity !== "number") {
-						return new Response("Missing or invalid temperature or humidity value", {
-							status: 400,
-						});
+				switch (request.headers.get("Content-Type")) {
+					case "application/json": {
+						const { timestamp, humidity, temperature, deviceId } = await request.json<DataKV>();
+						data = {
+							timestamp: z.number().safeParse(timestamp).data ?? Date.now(),
+							humidity: z.number().safeParse(humidity).data,
+							temperature: z.number().safeParse(temperature).data,
+							deviceId: z.string().safeParse(deviceId).data,
+						};
+						break;
 					}
+					case "application/x-www-form-urlencoded": {
+						const form = await request.formData();
 
-					if (!data.timestamp) {
-						data.timestamp = Date.now();
+						data = {
+							timestamp: z.number().safeParse(form.get("timestamp")).data ?? Date.now(),
+							humidity: z.number().safeParse(form.get("humidity")).data,
+							temperature: z.number().safeParse(form.get("temperature")).data,
+							deviceId: z.string().safeParse(form.get("deviceId")).data,
+						};
 					}
+				}
 
-					const key = `data_${data.timestamp}_${data.deviceId || "default"}`;
-
-					await env.ARDUINO_DATA_KV.put(key, JSON.stringify(data));
-
-					return new Response(JSON.stringify({ success: true, key }), {
-						headers: { "Content-Type": "application/json" },
-						status: 201,
-					});
-				} catch (error) {
-					return new Response(`Error processing data: ${error}`, {
+				if (typeof data.temperature !== "number" || typeof data.humidity !== "number") {
+					return new Response("Missing or invalid temperature or humidity value", {
 						status: 400,
 					});
 				}
+
+				const key = `data_${data.timestamp}_${data.deviceId || "default"}`;
+
+				await env.ARDUINO_DATA_KV.put(key, JSON.stringify(data), { expirationTtl: 86400 });
+
+				return new Response(JSON.stringify({ success: true, key }), {
+					headers: { "Content-Type": "application/json" },
+					status: 201,
+				});
 			}
 		}
 	},
@@ -86,27 +103,31 @@ export const service: Service = {
  */
 function aggregateReadings(readings: DataKV[], scale: TimeScale, limit: number): DataKV[] {
 	// If no readings or invalid scale, return empty array
-	if (readings.length === 0 || scale === "raw") {
-		return [];
-	}
 
-	const now = Date.now();
 	const aggregated: DataKV[] = [];
 	const buckets = new Map<number, { temperature: number[]; humidity: number[] }>();
 
 	// Define time bucket size in milliseconds
 	const bucketSize =
-		scale === "minute"
-			? 60000
-			: scale === "hour"
-				? 3600000
-				: scale === "day"
-					? 86400000
-					: scale === "week"
-						? 604800000
-						: scale === "month"
-							? 2592000000
-							: 3600000; // default to 1 hour
+		scale === "raw"
+			? 1
+			: scale === "30s"
+				? 30000
+				: scale === "1m"
+					? 60000
+					: scale === "5m"
+						? 300000
+						: scale === "1h"
+							? 3600000
+							: scale === "6h"
+								? 21600000
+								: scale === "24h"
+									? 86400000
+									: scale === "7d"
+										? 604800000
+										: scale === "30d"
+											? 2592000000
+											: 3600000; // default to 1 hour
 
 	// Group readings into time buckets
 	for (const reading of readings) {
