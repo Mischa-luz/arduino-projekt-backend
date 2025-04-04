@@ -76,6 +76,12 @@ export const service: Service = {
 							temperature: z.number().safeParse(form.get("temperature")).data,
 							deviceId: z.string().safeParse(form.get("deviceId")).data,
 						};
+						break;
+					}
+					default: {
+						return new Response("Unsupported Content-Type", {
+							status: 415,
+						});
 					}
 				}
 
