@@ -14,7 +14,7 @@ type GetDataResponse = DataKV[];
 type TimeScale = "raw" | "minute" | "hour" | "day" | "week" | "month";
 
 export const service: Service = {
-	path: "/v1/temperature/",
+	path: "/v1/data/",
 
 	fetch: async (
 		request: Request,
